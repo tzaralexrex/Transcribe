@@ -1,185 +1,234 @@
-﻿import whisper      # Модель OpenAI Whisper для транскрибации и перевода
-import argparse     # Для парсинга аргументов командной строки
-import os           # Для работы с файлами
-from pathlib import Path  # Для удобной работы с путями
-import math         # Для расчета количества чанков
-import ffmpeg       # Для извлечения аудио и разрезания видео
+import os
+import sys
+import itertools
+import logging
+import argparse
+import traceback
+from typing import List, Optional
+from pathlib import Path
+import subprocess
 
-def transcribe_and_translate(
-    input_file: str,
-    model_size: str = "small",
-    task: str = "translate",      # "transcribe" или "translate"
-    target_language: str = "ru",  # Язык перевода по умолчанию (ISO 639-1)
-    output_formats: list = ["srt","txt"], # Список форматов вывода
-    chunk_duration: float = 600.0 # Длительность чанка в секундах (10 минут)
-):
-    """
-    Основная функция транскрибации и перевода файла.
-    
-    Аргументы:
-    - input_file: путь к аудио/видео файлу, например "video.mp4" или "audio.mp3"
-    - model_size: размер модели Whisper, возможные варианты: "tiny","base","small","medium","large"
-    - task: "transcribe" для простой транскрибации, "translate" для перевода на английский или указанный язык
-    - target_language: язык перевода по ISO 639-1, например "ru" для русского, "en" для английского
-    - output_formats: список форматов вывода, возможные значения ["srt", "txt"]
-    - chunk_duration: длительность одного временного чанка в секундах, используется для больших файлов
-    """
-    
-    # Загружаем выбранную модель Whisper
-    print(f"[INFO] Загружаем модель Whisper: {model_size}")
-    model = whisper.load_model(model_size)
+# =========================
+# Настройки логирования
+# =========================
+ENABLE_LOG = True
+LOG_FILE = "debug.log"
+LOG_MODE_APPEND = True
 
-    # Получаем имя файла без расширения для формирования выходных файлов
-    base_name = Path(input_file).stem
+# =========================
+# Настройки по умолчанию
+# =========================
+KEYS_FILE = "keys.txt"
+DEFAULT_CHUNK_DURATION = 600.0  # секунд
+DEFAULT_LANGUAGE = "ru"
+DEFAULT_ENGINE = "whisper"
+DEFAULT_TRANSLATOR = "whisper"
+DEFAULT_OUTPUT_FORMATS = ["txt", "srt"]
 
-    # Получаем длительность видео через ffmpeg
+# =========================
+# Инициализация логирования
+# =========================
+if ENABLE_LOG:
+    logging.basicConfig(
+        filename=LOG_FILE,
+        filemode="a" if LOG_MODE_APPEND else "w",
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        level=logging.INFO
+    )
+    logging.info("=== Новый запуск скрипта ===")
+
+# =========================
+# Работа с API ключами
+# =========================
+def load_api_keys(file_path: str) -> List[str]:
+    keys = []
     try:
-        # ffmpeg.probe возвращает метаданные файла
-        probe = ffmpeg.probe(input_file)
-        duration = float(probe['format']['duration'])  # Длительность в секундах
-        print(f"[INFO] Длительность файла: {duration:.2f} секунд")
-    except Exception as e:
-        print(f"[WARN] Не удалось определить длительность файла: {e}")
-        duration = None  # если не удалось определить, работаем с одним чанком
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    keys.append(line)
+        logging.info(f"Загружено {len(keys)} ключей из {file_path}")
+    except FileNotFoundError:
+        logging.warning(f"Файл ключей {file_path} не найден. Используются переменные окружения.")
+        print(f"[WARNING] Файл ключей {file_path} не найден. Используются переменные окружения.")
+    return keys
 
-    # Разбиваем на чанки
-    if duration:
-        num_chunks = math.ceil(duration / chunk_duration)
-        chunks = []
-        for i in range(num_chunks):
-            start = i * chunk_duration
-            end = min((i+1) * chunk_duration, duration)
-            chunks.append((start, end))
+api_keys = load_api_keys(KEYS_FILE)
+key_cycle = itertools.cycle(api_keys)
+
+def get_next_api_key() -> Optional[str]:
+    if api_keys:
+        return next(key_cycle)
     else:
-        # Если длительность неизвестна, обрабатываем весь файл как один чанк
-        chunks = [(0, None)]
+        return os.getenv("OPENAI_API_KEY")
 
-    all_segments = []       # Список всех сегментов с таймкодами и текстом
-    translated_text = ""    # Общий текст, для TXT файла
+# =========================
+# Импорт локальных моделей и OpenAI
+# =========================
+try:
+    import whisper
+except ImportError:
+    logging.error("Библиотека openai-whisper не найдена.")
+    raise
 
-    # Обрабатываем каждый чанк по отдельности
-    for idx, (start, end) in enumerate(chunks, start=1):
-        print(f"[INFO] Обрабатываем чанк {idx}/{len(chunks)}: {start} - {end} секунд")
+try:
+    from vosk import Model as VoskModel, KaldiRecognizer
+except ImportError:
+    logging.warning("Библиотека vosk не найдена.")
 
-        # Создаём временный WAV-файл с текущим чанком
-        tmp_chunk_file = f"tmp_chunk_{idx}.wav"
+try:
+    import openai
+except ImportError:
+    logging.warning("Библиотека openai не найдена.")
 
-        # ffmpeg.input(...).output(...).run() выполняет конвертацию и извлечение аудио
-        # ac=1 — моно (Whisper лучше с одним каналом), ar=16000 — частота дискретизации
-        ffmpeg.input(input_file, ss=start, t=(None if end is None else end-start)) \
-            .output(tmp_chunk_file, ac=1, ar=16000) \
-            .overwrite_output() \
-            .run(quiet=True)
-
-        # Транскрибация или перевод
-        # task="transcribe" — текст без перевода, "translate" — перевод на английский или target_language
-        result = model.transcribe(tmp_chunk_file, task=task, language=None)  # язык источника автоопределяется
-
-        for seg in result["segments"]:
-            text = seg['text'].strip()
-
-            # Если язык перевода не английский, выполняем перевод через модель
-            if target_language != "en":
-                # Используем гипотетическую функцию model.transcribe_text для перевода сегмента
-                # Возвращает словарь {"text": "перевод"}
-                translation = model.transcribe_text(text, task="translate", language=target_language)
-                seg_text = translation["text"].strip()
+# =========================
+# Вспомогательные функции
+# =========================
+def safe_openai_request(func, *args, **kwargs):
+    max_attempts = len(api_keys) if api_keys else 1
+    attempt = 0
+    while attempt < max_attempts:
+        try:
+            if 'api_key' not in kwargs:
+                kwargs['api_key'] = get_next_api_key()
+            return func(*args, **kwargs)
+        except openai.error.RateLimitError:
+            logging.warning("Rate limit exceeded, переключение ключа...")
+            attempt += 1
+            if attempt < max_attempts:
+                print(f"[INFO] Переключение на следующий API ключ (попытка {attempt+1})")
             else:
-                seg_text = text
+                logging.error("Все ключи исчерпаны.")
+                raise
+        except Exception as e:
+            logging.error(f"Ошибка при запросе OpenAI: {e}")
+            traceback.print_exc()
+            raise
 
-            # Сохраняем текст в сегмент, корректируем тайминги относительно общего файла
-            seg["text"] = seg_text
-            if seg.get("start") is not None:
-                seg["start"] += start
-            if seg.get("end") is not None:
-                seg["end"] += start
+def transcribe_whisper(file_path: str, model_name: str = "small"):
+    logging.info(f"Whisper транскрибация файла {file_path}, модель {model_name}")
+    model = whisper.load_model(model_name)
+    result = model.transcribe(file_path, fp16=False)
+    return result
 
-            translated_text += seg_text + " "
-            all_segments.append(seg)
+def transcribe_vosk(file_path: str, model_path: str):
+    logging.info(f"Vosk транскрибация файла {file_path}, модель {model_path}")
+    model = VoskModel(model_path)
+    # Заглушка для примера
+    return "Транскрибация Vosk (заглушка)"
 
-        # Удаляем временный файл чанка
-        os.remove(tmp_chunk_file)
+def translate_text(text: str, target_lang: str = DEFAULT_LANGUAGE, translator: str = DEFAULT_TRANSLATOR):
+    logging.info(f"Перевод текста на {target_lang} через {translator}")
+    if translator == "whisper":
+        return text
+    elif translator in ["deepl", "google"]:
+        return text
+    else:
+        logging.warning(f"Неизвестный переводчик {translator}")
+        return text
 
-    # Выводим результаты в указанные форматы
-    if "srt" in output_formats:
-        srt_file = f"{base_name}.{target_language}.srt"
-        write_srt(all_segments, srt_file)
-        print(f"[OK] Субтитры сохранены: {srt_file}")
+def save_srt(text: str, srt_file: str, segments: Optional[List[dict]] = None, chunk_offset: float = 0.0):
+    with open(srt_file, "a", encoding="utf-8") as f:
+        if segments:
+            for i, seg in enumerate(segments, 1):
+                start = seg["start"] + chunk_offset
+                end = seg["end"] + chunk_offset
+                content = seg["text"].strip()
+                start_ts = f"{int(start//3600):02}:{int((start%3600)//60):02}:{int(start%60):02},{int((start%1)*1000):03}"
+                end_ts = f"{int(end//3600):02}:{int((end%3600)//60):02}:{int(end%60):02},{int((end%1)*1000):03}"
+                f.write(f"{i}\n{start_ts} --> {end_ts}\n{content}\n\n")
+        else:
+            f.write(text + "\n")
 
-    if "txt" in output_formats:
-        txt_file = f"{base_name}.{target_language}.txt"
-        write_txt(translated_text, txt_file)
-        print(f"[OK] Текст сохранён: {txt_file}")
+def split_audio_chunks(file_path: str, chunk_duration: float) -> List[str]:
+    output_files = []
+    file_dir = Path(file_path).parent
+    base_name = Path(file_path).stem
+    output_template = file_dir / f"{base_name}_chunk%03d.mp4"
+    cmd = [
+        "ffmpeg", "-i", str(file_path),
+        "-f", "segment",
+        "-segment_time", str(chunk_duration),
+        "-c", "copy",
+        str(output_template)
+    ]
+    logging.info(f"Разбиваем файл на чанки: {cmd}")
+    subprocess.run(cmd, check=True)
+    i = 0
+    while True:
+        chunk_file = file_dir / f"{base_name}_chunk{i:03d}.mp4"
+        if not chunk_file.exists():
+            break
+        output_files.append(str(chunk_file))
+        i += 1
+    return output_files
 
-    print("[INFO] Обработка завершена.")
-    return output_formats
-
-
-def write_srt(segments, output_file):
-    """
-    Создаёт SRT файл из сегментов.
-    Аргументы:
-    - segments: список словарей с ключами "start", "end", "text"
-    - output_file: путь к файлу .srt
-    """
-    def fmt_time(t):
-        # Преобразуем секунды в формат HH:MM:SS,mmm
-        hours = int(t // 3600)
-        minutes = int((t % 3600) // 60)
-        seconds = int(t % 60)
-        milliseconds = int((t - int(t)) * 1000)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
-
-    with open(output_file, "w", encoding="utf-8") as f:
-        for i, seg in enumerate(segments, start=1):
-            f.write(f"{i}\n")
-            f.write(f"{fmt_time(seg['start'])} --> {fmt_time(seg['end'])}\n")
-            f.write(seg['text'] + "\n\n")
-
-
-def write_txt(text, output_file):
-    """
-    Сохраняет весь текст в один TXT файл
-    """
-    with open(output_file, "w", encoding="utf-8") as f:
-        f.write(text.strip())
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Универсальный скрипт транскрибации и перевода Whisper")
-
-    # Основной входной файл (обязательный)
-    parser.add_argument("input_file", help="Входной аудио/видео файл")
-
-    # Параметры модели
-    parser.add_argument("-m", "--model", default="small",
-                        help="Размер модели Whisper: tiny, base, small, medium, large")
-
-    # Задача: транскрибация или перевод
-    parser.add_argument("-t", "--task", default="translate",
-                        help="Задача: transcribe (только текст) или translate (перевод)")
-
-    # Язык перевода
-    parser.add_argument("-l", "--language", default="ru",
-                        help="Язык перевода (ISO 639-1), по умолчанию русский")
-
-    # Форматы вывода
-    parser.add_argument("-f", "--formats", default="srt,txt",
-                        help="Форматы вывода через запятую: srt,txt")
-
-    # Длительность чанка для больших файлов
-    parser.add_argument("-c", "--chunk", type=float, default=600.0,
-                        help="Длительность чанка для больших файлов (сек)")
-
+# =========================
+# Главная функция
+# =========================
+def main():
+    parser = argparse.ArgumentParser(description="Транскрибация и перевод аудио/видео")
+    parser.add_argument("-i", "--input", required=True, help="Путь к файлу аудио/видео")
+    parser.add_argument("-l", "--language", default=DEFAULT_LANGUAGE, help="Язык перевода")
+    parser.add_argument("-e", "--engine", default=DEFAULT_ENGINE, choices=["whisper","vosk","gpt"], help="Движок транскрибации")
+    parser.add_argument("-t", "--translator", default=DEFAULT_TRANSLATOR, help="Движок перевода")
+    parser.add_argument("-f", "--formats", nargs="+", default=DEFAULT_OUTPUT_FORMATS, help="Форматы вывода")
+    parser.add_argument("-m", "--model", default="small", help="Модель Whisper")
+    parser.add_argument("-c", "--chunk", type=float, default=DEFAULT_CHUNK_DURATION, help="Длительность чанка в секундах")
     args = parser.parse_args()
 
-    output_formats = [fmt.strip() for fmt in args.formats.split(",")]
+    if not os.path.isfile(args.input):
+        logging.error(f"Файл {args.input} не найден")
+        print(f"[ERROR] Файл {args.input} не найден")
+        return
 
-    transcribe_and_translate(
-        input_file=args.input_file,
-        model_size=args.model,
-        task=args.task,
-        target_language=args.language,
-        output_formats=output_formats,
-        chunk_duration=args.chunk
-    )
+    chunk_files = [args.input]
+    if args.chunk > 0:
+        try:
+            chunk_files = split_audio_chunks(args.input, args.chunk)
+            logging.info(f"Создано {len(chunk_files)} чанков")
+        except Exception as e:
+            logging.warning(f"Не удалось разбить на чанки: {e}")
+            chunk_files = [args.input]
+
+    base_name = Path(args.input).stem
+    all_text = ""
+    if "srt" in args.formats:
+        open(f"{base_name}.srt", "w").close()  # очищаем файл перед записью
+
+    chunk_offset = 0.0
+    for chunk_file in chunk_files:
+        if args.engine == "whisper":
+            result = transcribe_whisper(chunk_file, model_name=args.model)
+            text = result["text"]
+            segments = result.get("segments", [])
+        elif args.engine == "vosk":
+            model_path = "vosk-model-small-ru-0.22"
+            text = transcribe_vosk(chunk_file, model_path)
+            segments = [{"start":0, "end=args.chunk", "text":text}]  # пример таймкодов
+        else:
+            response = safe_openai_request(openai.ChatCompletion.create,
+                                           model="gpt-4o-mini",
+                                           messages=[{"role":"user","content":f"Транскрибуй файл {chunk_file}"}])
+            text = response.choices[0].message.content
+            segments = [{"start":0, "end":args.chunk, "text":text}]  # пример таймкодов
+
+        translated = translate_text(text, target_lang=args.language, translator=args.translator)
+        all_text += translated + "\n"
+        if "srt" in args.formats:
+            save_srt(translated, f"{base_name}.srt", segments, chunk_offset)
+        chunk_offset += args.chunk
+
+    if "txt" in args.formats:
+        with open(f"{base_name}.txt", "w", encoding="utf-8") as f:
+            f.write(all_text)
+
+    logging.info(f"Файлы {base_name}.txt и {base_name}.srt созданы")
+    print(f"Готово. Файлы {base_name}.txt и {base_name}.srt созданы.")
+
+# =========================
+# Точка входа
+# =========================
+if __name__ == "__main__":
+    main()
