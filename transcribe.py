@@ -1,3 +1,4 @@
+
 import os
 import sys
 import itertools
@@ -24,6 +25,8 @@ DEFAULT_LANGUAGE = "ru"
 DEFAULT_ENGINE = "whisper"  # движок по умолчанию
 DEFAULT_TRANSLATOR = None  # перевод по умолчанию отключен
 DEFAULT_OUTPUT_FORMATS = ["txt", "srt"]
+
+# Путь к локальным моделям Whisper, теперь относительный к текущему каталогу
 MODEL_DIR = os.path.join(os.getcwd(), "whisper_models")
 
 # =========================
@@ -37,7 +40,6 @@ if ENABLE_LOG:
         level=logging.INFO,
     )
     logging.info("=== Новый запуск скрипта ===")
-
 
 # =========================
 # Работа с API ключами
@@ -66,7 +68,6 @@ def get_next_api_key() -> Optional[str]:
     else:
         return os.getenv("OPENAI_API_KEY")
 
-
 # =========================
 # Импорт локальных моделей и OpenAI
 # =========================
@@ -86,7 +87,6 @@ try:
     import openai
 except ImportError:
     logging.warning("Библиотека openai не найдена.")
-
 
 # =========================
 # Вспомогательные функции
@@ -112,7 +112,6 @@ def safe_openai_request(func, *args, **kwargs):
             traceback.print_exc()
             raise
 
-
 def transcribe_whisper(file_path: str, model_name: str = "small", language: str = DEFAULT_LANGUAGE):
     logging.info(f"Whisper транскрибация файла {file_path}, модель {model_name}, язык={language}")
 
@@ -137,13 +136,11 @@ def transcribe_whisper(file_path: str, model_name: str = "small", language: str 
 
     return result
 
-
 def transcribe_vosk(file_path: str, model_path: str):
     logging.info(f"Vosk транскрибация файла {file_path}, модель {model_path}")
     model = VoskModel(model_path)
     # Заглушка для примера
     return "Транскрибация Vosk (заглушка)"
-
 
 def translate_text(text: str, target_lang: str = DEFAULT_LANGUAGE, translator: Optional[str] = DEFAULT_TRANSLATOR):
     if not translator:
@@ -161,7 +158,6 @@ def translate_text(text: str, target_lang: str = DEFAULT_LANGUAGE, translator: O
         logging.warning(f"Неизвестный переводчик {translator}")
         return text
 
-
 def save_srt(text: str, srt_file: str, segments: Optional[List[dict]] = None, chunk_offset: float = 0.0):
     with open(srt_file, "a", encoding="utf-8") as f:
         if segments:
@@ -169,12 +165,14 @@ def save_srt(text: str, srt_file: str, segments: Optional[List[dict]] = None, ch
                 start = seg["start"] + chunk_offset
                 end = seg["end"] + chunk_offset
                 content = seg["text"].strip()
+
+                # Исправлена строка с f-string для корректности
                 start_ts = f"{int(start // 3600):02}:{int((start % 3600) // 60):02}:{int(start % 60):02},{int((start % 1) * 1000):03}"
                 end_ts = f"{int(end // 3600):02}:{int((end % 3600) // 60):02}:{int(end % 60):02},{int((end % 1) * 1000):03}"
+
                 f.write(f"{i}\n{start_ts} --> {end_ts}\n{content}\n\n")
         else:
-            f.write(text + "\n")
-
+            f.write(text + "")
 
 def split_audio_chunks(file_path: str, chunk_duration: float) -> List[str]:
     output_files = []
@@ -206,13 +204,14 @@ def split_audio_chunks(file_path: str, chunk_duration: float) -> List[str]:
         i += 1
     return output_files
 
-
 # =========================
 # Главная функция
 # =========================
+# Позиционный аргумент input_file вместо ключа --input
+
 def main():
     parser = argparse.ArgumentParser(description="Транскрибация и перевод аудио/видео")
-    parser.add_argument("-i", "--input", required=True, help="Путь к файлу аудио/видео")
+    parser.add_argument("input_file", help="Путь к файлу аудио/видео")  # Позиционный аргумент, обязательный
     parser.add_argument("-l", "--language", default=DEFAULT_LANGUAGE, help="Язык вывода ('auto' для автоопределения)")
     parser.add_argument("-e", "--engine", default=DEFAULT_ENGINE, choices=["whisper", "vosk", "gpt"], help="Движок транскрибации")
     parser.add_argument("-t", "--translator", default=DEFAULT_TRANSLATOR, help="Движок перевода (по умолчанию отключен)")
@@ -221,21 +220,23 @@ def main():
     parser.add_argument("-c", "--chunk", type=float, default=DEFAULT_CHUNK_DURATION, help="Длительность чанка в секундах")
     args = parser.parse_args()
 
-    if not os.path.isfile(args.input):
-        logging.error(f"Файл {args.input} не найден")
-        print(f"[ERROR] Файл {args.input} не найден")
+    input_file = args.input_file
+
+    if not os.path.isfile(input_file):
+        logging.error(f"Файл {input_file} не найден")
+        print(f"[ERROR] Файл {input_file} не найден")
         return
 
-    chunk_files = [args.input]
+    chunk_files = [input_file]
     if args.chunk > 0:
         try:
-            chunk_files = split_audio_chunks(args.input, args.chunk)
+            chunk_files = split_audio_chunks(input_file, args.chunk)
             logging.info(f"Создано {len(chunk_files)} чанков")
         except Exception as e:
             logging.warning(f"Не удалось разбить на чанки: {e}")
-            chunk_files = [args.input]
+            chunk_files = [input_file]
 
-    base_name = Path(args.input).stem
+    base_name = Path(input_file).stem
     all_text = ""
 
     if "srt" in args.formats:
@@ -261,7 +262,7 @@ def main():
             segments = [{"start": 0, "end": args.chunk, "text": text}]
 
         translated = translate_text(text, target_lang=args.language, translator=args.translator)
-        all_text += translated + "\n"
+        all_text += translated + ""
 
         if "srt" in args.formats:
             save_srt(translated, f"{base_name}.srt", segments, chunk_offset)
