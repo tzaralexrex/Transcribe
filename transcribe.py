@@ -8,91 +8,12 @@ from typing import List, Optional
 from pathlib import Path
 import subprocess
 
-# --- Проверка и (при необходимости) установка внешних зависимостей ---
-import importlib
-try:
-    from importlib.metadata import version as get_version, PackageNotFoundError
-except ImportError:
-    from importlib_metadata import version as get_version, PackageNotFoundError  # для Python<3.8
-from packaging.version import parse as parse_version
-import requests
-
-CHECK_VER = 1  # Можно вынести в настройки, если нужен контроль
-
-def import_or_update(module_name, pypi_name=None, min_version=None, force_check=False):
-    """
-    Импортирует модуль, при необходимости обновляет или ставит с PyPI.
-    """
-    pypi_name = pypi_name or module_name
-    if 'CHECK_VER' in globals() and not CHECK_VER and not force_check:
-        try:
-            return importlib.import_module(module_name)
-        except ImportError:
-            logging.debug(f"import_or_update: ImportError: {module_name} ({pypi_name}) не найден")
-            print(f"\n[!] Необходимый модуль {pypi_name} не установлен. pip install {pypi_name}")
-            sys.exit(1)
-    print(f"Проверяю модуль {pypi_name}...", end='', flush=True)
-    try:
-        module = importlib.import_module(module_name)
-        try:
-            resp = requests.get(f"https://pypi.org/pypi/{pypi_name}/json", timeout=5)
-            if resp.ok:
-                latest = resp.json()['info']['version']
-                try:
-                    installed = get_version(pypi_name)
-                except PackageNotFoundError:
-                    installed = getattr(module, '__version__', None)
-                if installed and parse_version(installed) < parse_version(latest):
-                    print(f"\n[!] Новая версия {pypi_name}: {installed} → {latest}. Обновляю...", end='', flush=True)
-                    logging.debug(f"import_or_update: обновление {pypi_name}: {installed} → {latest}")
-                    subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", pypi_name])
-                    module = importlib.reload(module)
-            print(" - OK")
-        except Exception as e:
-            logging.debug(f"import_or_update: ошибка проверки/обновления {pypi_name}: {e}")
-            print(f"[!] Не удалось проверить или обновить {pypi_name}: {e}")
-        if min_version:
-            try:
-                installed = get_version(pypi_name)
-            except PackageNotFoundError:
-                installed = getattr(module, '__version__', None)
-            if installed and parse_version(installed) < parse_version(min_version):
-                print(f"\n[!] Требуется версия {min_version} для {pypi_name}, обновляю...")
-                logging.debug(f"import_or_update: обновление до min_version {min_version}")
-                subprocess.check_call([sys.executable, "-m", "pip", "install", f"{pypi_name}>={min_version}"])
-                module = importlib.reload(module)
-        return module
-    except ImportError:
-        logging.debug(f"import_or_update: ImportError: {module_name} ({pypi_name}) не установлен, пробуем установить через pip")
-        print(f"[!] {pypi_name} не установлен. pip install...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pypi_name])
-        return importlib.import_module(module_name)
-
-# --- Обязательные внешние зависимости ---
-whisper = import_or_update("whisper", "openai-whisper", "20231101")
-openai = import_or_update("openai", "openai", "1.6")
-try:
-    from vosk import Model as VoskModel, KaldiRecognizer
-except Exception:
-    vosk = import_or_update("vosk", "vosk", "0.3.45")
-requests = import_or_update("requests", "requests", "2.30")
-
 # =========================
 # Настройки логирования
 # =========================
 ENABLE_LOG = True
 LOG_FILE = "debug.log"
 LOG_MODE_APPEND = True
-
-# Инициализация логирования с уровнем DEBUG
-if ENABLE_LOG:
-    logging.basicConfig(
-        filename=LOG_FILE,
-        filemode="a" if LOG_MODE_APPEND else "w",
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        level=logging.DEBUG
-    )
-    logging.info("=== Новый запуск скрипта ===")
 
 # =========================
 # Настройки по умолчанию
@@ -103,7 +24,20 @@ DEFAULT_LANGUAGE = "ru"
 DEFAULT_ENGINE = "whisper"  # движок по умолчанию
 DEFAULT_TRANSLATOR = None  # перевод по умолчанию отключен
 DEFAULT_OUTPUT_FORMATS = ["txt", "srt"]
-MODEL_DIR = "F:/Transcribe/models"  # путь к локальным моделям Whisper
+MODEL_DIR = os.path.join(os.getcwd(), "whisper_models")
+
+# =========================
+# Инициализация логирования
+# =========================
+if ENABLE_LOG:
+    logging.basicConfig(
+        filename=LOG_FILE,
+        filemode="a" if LOG_MODE_APPEND else "w",
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        level=logging.INFO,
+    )
+    logging.info("=== Новый запуск скрипта ===")
+
 
 # =========================
 # Работа с API ключами
@@ -121,14 +55,38 @@ def load_api_keys(file_path: str) -> List[str]:
         logging.warning(f"Файл ключей {file_path} не найден.")
     return keys
 
+
 api_keys = load_api_keys(KEYS_FILE)
 key_cycle = itertools.cycle(api_keys)
+
 
 def get_next_api_key() -> Optional[str]:
     if api_keys:
         return next(key_cycle)
     else:
         return os.getenv("OPENAI_API_KEY")
+
+
+# =========================
+# Импорт локальных моделей и OpenAI
+# =========================
+
+try:
+    import whisper
+except ImportError:
+    logging.error("Библиотека openai-whisper не найдена.")
+    raise
+
+try:
+    from vosk import Model as VoskModel, KaldiRecognizer
+except ImportError:
+    logging.warning("Библиотека vosk не найдена.")
+
+try:
+    import openai
+except ImportError:
+    logging.warning("Библиотека openai не найдена.")
+
 
 # =========================
 # Вспомогательные функции
@@ -138,14 +96,14 @@ def safe_openai_request(func, *args, **kwargs):
     attempt = 0
     while attempt < max_attempts:
         try:
-            if 'api_key' not in kwargs:
-                kwargs['api_key'] = get_next_api_key()
+            if "api_key" not in kwargs:
+                kwargs["api_key"] = get_next_api_key()
             return func(*args, **kwargs)
         except openai.error.RateLimitError:
             logging.warning("Rate limit exceeded, переключение ключа...")
             attempt += 1
             if attempt < max_attempts:
-                print(f"[INFO] Переключение на следующий API ключ (попытка {attempt+1})")
+                print(f"[INFO] Переключение на следующий API ключ (попытка {attempt + 1})")
             else:
                 logging.error("Все ключи исчерпаны.")
                 raise
@@ -154,8 +112,10 @@ def safe_openai_request(func, *args, **kwargs):
             traceback.print_exc()
             raise
 
+
 def transcribe_whisper(file_path: str, model_name: str = "small", language: str = DEFAULT_LANGUAGE):
     logging.info(f"Whisper транскрибация файла {file_path}, модель {model_name}, язык={language}")
+
     try:
         if MODEL_DIR and os.path.isdir(MODEL_DIR) and os.listdir(MODEL_DIR):
             model = whisper.load_model(model_name, download_root=MODEL_DIR)
@@ -174,7 +134,9 @@ def transcribe_whisper(file_path: str, model_name: str = "small", language: str 
         print(f"[INFO] Whisper определил язык: {detected_lang}")
     else:
         result = model.transcribe(file_path, fp16=False, language=language)
+
     return result
+
 
 def transcribe_vosk(file_path: str, model_path: str):
     logging.info(f"Vosk транскрибация файла {file_path}, модель {model_path}")
@@ -182,17 +144,23 @@ def transcribe_vosk(file_path: str, model_path: str):
     # Заглушка для примера
     return "Транскрибация Vosk (заглушка)"
 
+
 def translate_text(text: str, target_lang: str = DEFAULT_LANGUAGE, translator: Optional[str] = DEFAULT_TRANSLATOR):
     if not translator:
         return text
+
     logging.info(f"Перевод текста на {target_lang} через {translator}")
+
     if translator == "whisper":
+        # Реализация перевода через whisper пока не сделана
         return text
     elif translator in ["deepl", "google"]:
+        # Реализация перевода через выбранные сервисы пока не сделана
         return text
     else:
         logging.warning(f"Неизвестный переводчик {translator}")
         return text
+
 
 def save_srt(text: str, srt_file: str, segments: Optional[List[dict]] = None, chunk_offset: float = 0.0):
     with open(srt_file, "a", encoding="utf-8") as f:
@@ -201,11 +169,12 @@ def save_srt(text: str, srt_file: str, segments: Optional[List[dict]] = None, ch
                 start = seg["start"] + chunk_offset
                 end = seg["end"] + chunk_offset
                 content = seg["text"].strip()
-                start_ts = f"{int(start//3600):02}:{int((start%3600)//60):02}:{int(start%60):02},{int((start%1)*1000):03}"
-                end_ts = f"{int(end//3600):02}:{int((end%3600)//60):02}:{int(end%60):02},{int((end%1)*1000):03}"
+                start_ts = f"{int(start // 3600):02}:{int((start % 3600) // 60):02}:{int(start % 60):02},{int((start % 1) * 1000):03}"
+                end_ts = f"{int(end // 3600):02}:{int((end % 3600) // 60):02}:{int(end % 60):02},{int((end % 1) * 1000):03}"
                 f.write(f"{i}\n{start_ts} --> {end_ts}\n{content}\n\n")
         else:
             f.write(text + "\n")
+
 
 def split_audio_chunks(file_path: str, chunk_duration: float) -> List[str]:
     output_files = []
@@ -214,11 +183,16 @@ def split_audio_chunks(file_path: str, chunk_duration: float) -> List[str]:
     output_template = file_dir / f"{base_name}_chunk%03d.mp4"
 
     cmd = [
-        "ffmpeg", "-i", str(file_path),
-        "-f", "segment",
-        "-segment_time", str(chunk_duration),
-        "-c", "copy",
-        str(output_template)
+        "ffmpeg",
+        "-i",
+        str(file_path),
+        "-f",
+        "segment",
+        "-segment_time",
+        str(chunk_duration),
+        "-c",
+        "copy",
+        str(output_template),
     ]
     logging.info(f"Разбиваем файл на чанки: {cmd}")
     subprocess.run(cmd, check=True)
@@ -232,6 +206,7 @@ def split_audio_chunks(file_path: str, chunk_duration: float) -> List[str]:
         i += 1
     return output_files
 
+
 # =========================
 # Главная функция
 # =========================
@@ -239,7 +214,7 @@ def main():
     parser = argparse.ArgumentParser(description="Транскрибация и перевод аудио/видео")
     parser.add_argument("-i", "--input", required=True, help="Путь к файлу аудио/видео")
     parser.add_argument("-l", "--language", default=DEFAULT_LANGUAGE, help="Язык вывода ('auto' для автоопределения)")
-    parser.add_argument("-e", "--engine", default=DEFAULT_ENGINE, choices=["whisper","vosk","gpt"], help="Движок транскрибации")
+    parser.add_argument("-e", "--engine", default=DEFAULT_ENGINE, choices=["whisper", "vosk", "gpt"], help="Движок транскрибации")
     parser.add_argument("-t", "--translator", default=DEFAULT_TRANSLATOR, help="Движок перевода (по умолчанию отключен)")
     parser.add_argument("-f", "--formats", nargs="+", default=DEFAULT_OUTPUT_FORMATS, help="Форматы вывода")
     parser.add_argument("-m", "--model", default="small", help="Модель Whisper")
@@ -264,7 +239,7 @@ def main():
     all_text = ""
 
     if "srt" in args.formats:
-        open(f"{base_name}.srt", "w").close() # очищаем файл перед записью
+        open(f"{base_name}.srt", "w").close()  # очищаем файл перед записью
 
     chunk_offset = 0.0
     for chunk_file in chunk_files:
@@ -275,13 +250,15 @@ def main():
         elif args.engine == "vosk":
             model_path = "vosk-model-small-ru-0.22"
             text = transcribe_vosk(chunk_file, model_path)
-            segments = [{"start":0, "end":args.chunk, "text":text}]
+            segments = [{"start": 0, "end": args.chunk, "text": text}]
         else:
-            response = safe_openai_request(openai.ChatCompletion.create,
-                                           model="gpt-4o-mini",
-                                           messages=[{"role":"user","content":f"Транскрибуй файл {chunk_file}"}])
+            response = safe_openai_request(
+                openai.ChatCompletion.create,
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": f"Транскрибуй файл {chunk_file}"}],
+            )
             text = response.choices[0].message.content
-            segments = [{"start":0, "end":args.chunk, "text":text}]
+            segments = [{"start": 0, "end": args.chunk, "text": text}]
 
         translated = translate_text(text, target_lang=args.language, translator=args.translator)
         all_text += translated + "\n"
@@ -296,6 +273,7 @@ def main():
 
     logging.info(f"Файлы {base_name}.txt и {base_name}.srt созданы")
     print(f"Готово. Файлы {base_name}.txt и {base_name}.srt созданы.")
+
 
 # =========================
 # Точка входа
